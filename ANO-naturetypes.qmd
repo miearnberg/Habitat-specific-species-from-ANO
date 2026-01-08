@@ -1,0 +1,1264 @@
+---
+title: "Habitat-specific species from ANO"
+format:
+  html:
+    embed-resources: true
+    code-tools: true
+    css: styles.css
+editor: visual
+---
+
+
+```{r}
+#| message: false
+#| warning: false
+#| output: false
+
+library(sf)
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(forcats)
+library(ggbreak)
+library(vegan)
+library(gridExtra)
+library(writexl)
+library(stringr)
+library(patchwork)
+
+Sys.setlocale(locale = "no_NB.utf8")
+
+ANO.sp <- st_read(ano_gdb_path, layer = "ANO_Art", quiet = TRUE)
+ANO.geo <- st_read(ano_gdb_path, layer="ANO_SurveyPoint", quiet = T)
+```
+
+
+# 
+
+# Cleaning
+
+```{r}
+#| message: false
+#| warning: false
+# group under species to species
+ANO.sp <- ANO.sp %>% 
+            mutate(art_navn = str_squish(art_navn),                             
+              art_navn = if_else(str_count(art_navn, "\\S+") >= 3,              
+                word(art_navn, 1, 2),                                       
+                art_navn)) %>% 
+            group_by(parentglobalid, art_navn) %>% 
+            summarise(art_dekning   = sum(art_dekning, na.rm = TRUE),              
+                      art_norsk_navn = first(art_norsk_navn),                      
+                      creator        = first(creator),
+                      creationdate   = first(creationdate),
+                      editor         = first(editor),
+                      editdate       = first(editdate),
+                      .groups = "drop")
+
+# Some species are registeres but does not have cover,
+ANO.sp <- ANO.sp %>%
+           filter(art_dekning > 0)
+
+# Clean up kartleggingsenhet and take out plots with missing data
+ANO.geo1 <- ANO.geo %>% 
+              mutate(kartleggingsenhet_1m2 = str_extract(kartleggingsenhet_1m2, "^[A-Z0-9]+-[A-Z]+-[0-9]+"),
+                     kartleggingsenhet_1m2 = na_if(kartleggingsenhet_1m2, "ikke_kartlagt"),
+                     kartleggingsenhet_1m2 = na_if(kartleggingsenhet_1m2, "L")) %>% 
+              filter(!(is.na(kartleggingsenhet_1m2) | kartleggingsenhet_1m2 == ""))
+
+# Fix variable names 
+ANO.geo1 <- ANO.geo1 %>%
+              rename_with(.cols = starts_with("bv_"),
+                          .fn = ~ toupper(str_remove(.x, "^bv_")))
+
+ANO.geo1 <- ANO.geo1 %>%
+                mutate(across('7GR_GI':'7SE', ~ {
+                       ifelse( is.na(.x),
+                                NA,
+                                str_extract(.x, "(?<=_)[^_]+$"))   
+                      }))
+
+df <- ANO.geo1 %>% st_drop_geometry()
+vars <- names(df)[match("7GR_GI", names(df)) :
+                  match("7SE", names(df))]
+tables_list <- lapply(vars, function(v) {
+                      table(df[[v]], useNA = "ifany")
+                      })
+names(tables_list) <- vars
+
+tables_list
+```
+
+```{r}
+#| message: false
+#| warning: false
+# Add bioclimatic sones 
+temp <- st_read(sone_path, quiet = TRUE)
+
+temp_df <- temp %>%
+            st_drop_geometry() %>%
+            select(SSBID, Sone_kode, Sone_navn)
+ 
+ANO.geo2 <- ANO.geo1 %>%
+                left_join(temp_df, by = c("ssb_id" = "SSBID")) %>%
+                select(globalid, ssb_id, Sone_kode, Sone_navn, everything())
+```
+
+# 
+
+# Rescale and create tilstand variables
+
+In the ANO system, the condition variables 7SE (spor etter slitasje) and 7TK (spor etter ferdsel med tunge kjøretøy) are recorded on a four-step categorical scale (0–3 + X).However, in the Miljødirektoratet (Mdir) classification system, the equivalent assessment variables (MdirPRSL and MdirPRTK) are expressed on a seven-step numeric scale (0–7), which is the basis for assigning the tilstandsklasser god, moderat, dårlig and svært redusert.
+
+| 7SE/TK scale      | Mdir scale   | Mdir classification scale  |
+|-------------------|--------------|----------------------------|
+| 0: 0              | 0: 0–3 %     | god: 0,1,2 (\<6,25%)       |
+| 1: 0–1/16         | 1: 3–6.25 %  | moderat: 3,4 (6,25-25%)    |
+| 2: 1/16–1/2       | 3: 6.25–12.5 | dårlig: 5 (25-50%)         |
+| 3: \>1/2          | 4: 12.5–25 % | svært redusert 6,7 (\>50%) |
+| X: not registered | 5: 25–50 %   |                            |
+|                   | 6: 50–75 %   |                            |
+|                   | 7: \>75 %    |                            |
+
+ANO also records information that corresponds to 1AG-B (Busksjiktdekning) and 7FA (Fremmedartsinnslag) variables used in the Mdir system. In ANO, these are registered as the percentage variables busker_dekning and fremmedarter_total_dekning. Because these values are measured on a continuous percent scale, while the Mdir system uses an ordinal condition scale (0–7), the ANO values must be translated into the appropriate Mdir performance step.
+
+```{r}
+# 7SE and 7TK scales to Mdir scales.
+ANO.geo2 <- ANO.geo2 %>%
+                mutate(`7SE_chr` = as.character(`7SE`),
+                        MdirPRSL = case_when(`7SE_chr` == "X" ~ NA_integer_,  # ikke registrert
+                                             `7SE_chr` == "0" ~ 0L,           # 0 % → trinn 0
+                                             `7SE_chr` == "1" ~ 1L,           # 0–1/16 → trinn 1
+                                             `7SE_chr` == "2" ~ 4L,           # 1/16–1/2 → trinn 4
+                                             `7SE_chr` == "3" ~ 6L,           # > 1/2 → trinn 6
+                                              TRUE ~ NA_integer_)) %>%
+                relocate(MdirPRSL, .after = `7SE`) %>%
+                select(-`7SE_chr`)
+
+
+ANO.geo2 <- ANO.geo2 %>%
+              mutate(`7TK_chr` = as.character(`7TK`),
+                     MdirPRTK = case_when(`7TK_chr` == "X" ~ NA_integer_,  # ikke registrert
+                                          `7TK_chr` == "0" ~ 0L,           # 0 %
+                                          `7TK_chr` == "1" ~ 1L,           # 0–1/16 %
+                                          `7TK_chr` == "2" ~ 4L,           # 1/16–1/2 %
+                                          `7TK_chr` == "3" ~ 6L,           # > 1/2 %
+                                          TRUE ~ NA_integer_)) %>%
+              relocate(MdirPRTK, .after = `7TK`) %>%
+              select(-`7TK_chr`)
+
+
+# 1AG-B gjengroing med busker 
+ANO.geo2 <- ANO.geo2 %>%
+              mutate('1AG-B' = case_when(busker_dekning >= 0   & busker_dekning < 2.5  ~ 1,
+                                         busker_dekning >= 2.5 & busker_dekning < 5    ~ 2,
+                                         busker_dekning >= 5   & busker_dekning < 10   ~ 3,
+                                         busker_dekning >= 10  & busker_dekning < 25   ~ 4,
+                                         busker_dekning >= 25  & busker_dekning < 50   ~ 5,
+                                         busker_dekning >= 50  & busker_dekning < 75   ~ 6,
+                                         busker_dekning >= 75  & busker_dekning < 90   ~ 7,
+                                         busker_dekning >= 90  ~ 8,
+                                         TRUE                  ~ NA_real_)) %>%
+              relocate(`1AG-B`, .after = MdirPRSL)
+
+
+# 7FA fremmedarts innslag.
+ANO.geo2 <- ANO.geo2 %>%
+              mutate('7FA' = case_when(is.na(fremmedarter_total_dekning)               ~ "X",   # ikke registrert
+                                        fremmedarter_total_dekning == 0                                      ~ "0",   # uten fremmedarter
+                                        fremmedarter_total_dekning > 0 & fremmedarter_total_dekning <= 2.5   ~ "1",   # svak effekt
+                                        fremmedarter_total_dekning > 2.5 & fremmedarter_total_dekning <= 5   ~ "2",   # nokså svak
+                                        fremmedarter_total_dekning > 5 & fremmedarter_total_dekning <= 15    ~ "3",   # middels sterk
+                                        fremmedarter_total_dekning > 15 & fremmedarter_total_dekning <= 40   ~ "4",   # nokså sterk
+                                        fremmedarter_total_dekning > 40 & fremmedarter_total_dekning <= 80   ~ "5",   # sterk effekt
+                                        fremmedarter_total_dekning > 80                                      ~ "6",   # nesten bare fremmedarter
+                                        TRUE ~ NA_character_)) %>%
+               relocate('7FA', .after = '1AG-B')
+```
+
+# 
+
+# Filter rules
+
+## Infer and take out plots without naturtypes
+
+We need nature type from the mdir classification system to be registered. Condition evaluation rules in “tilstand” depend on the nature type.
+
+Example: Beitetrykk value 3 could be:
+
+-   “Moderate condition” for Naturtype A
+
+-   “Good condition” for Naturtype B
+
+-   “Bad condition” for Naturtype C
+
+For plots with no nature type we have no way of evaluating their tilstand.
+
+```{r}
+#| message: false
+#| warning: false
+#| echo: false
+#| output: false
+
+ANO.geo2 %>% st_drop_geometry %>%
+                mutate(forekomst_ntyp_clean = case_when(is.na(forekomst_ntyp)  ~ "NA",
+                                                        forekomst_ntyp == ""   ~ "blank",
+                                                        TRUE                   ~ tolower(forekomst_ntyp))) %>%
+                count(forekomst_ntyp_clean) %>%
+                bind_rows(summarise(., 
+                                  forekomst_ntyp_clean = "total", 
+                                  n = sum(n)))
+```
+
+| Nature type | n         |
+|-------------|-----------|
+| ja          | 7225      |
+| nei         | 9593      |
+| blank       | 506       |
+| NA          | 767       |
+| **Total**   | **18091** |
+
+### Infer nature type
+
+Many plots in the ANO dataset have a mapped kartleggingsenhet (NIN system) and sone (bioclimatic zone), but no registered nature type after the mdir system. To help fill these gaps, we identify which nature types could occur in each location. Each kartleggingsenhet (e.g., T4-C-5) can occur in one or more possible nature types in the lookup table naturinfo. Some nature types also have restrictions on which bioclimatic zones (sone) they can occur in.
+
+In this step we:
+
+1.  Select all areas that lack a valid nature type, but do have a kartleggingsenhet and a sone.
+
+2.  Join these areas with the look-up table of allowable nature types for each kartleggingsenhet.
+
+3.  Filter out nature types that cannot occur in the area’s sone.
+
+4.  Produce a compact list of candidate nature types for each observation.
+
+The final result is a set of inferred nature type candidates for all units where nature type is missing.
+
+```{r}
+#| message: false
+#| warning: false
+naturinfo <- read_excel("Naturtyper_informasjon.xlsx")
+
+# clean nature type names so they correspond with look up
+ANO.geo2 <- ANO.geo2 %>%
+                mutate(ntyp_clean = gsub("^ntyp_", "", ntyp),
+                        ntyp_clean = sub("^([A-Z]\\d+)_0*([0-9]+)_0*([0-9]+)$", "\\1.\\2.\\3", ntyp_clean),
+                        ntyp_clean = sub("^([A-Z]\\d+)_0*([0-9]+)$", "\\1.\\2", ntyp_clean),
+                        ntyp_clean = sub("^([A-Z])0*([0-9]+)\\.(.*)$", "\\1\\2.\\3", ntyp_clean),
+                        ntyp_clean = sub("^(.*\\.)(0*)([0-9]+)\\.(0*)([0-9]+)$", "\\1\\3.\\5", ntyp_clean),
+                        ntyp_clean = sub("^([A-Z])0*([0-9]+)$", "\\1\\2", ntyp_clean))
+
+ANO.geo_reg <- ANO.geo2 %>%
+                filter(ntyp %in% c("nei", "blank", NA)) %>%
+                filter(!is.na(Sone_kode)) %>% 
+                select(globalid, Sone_kode, kartleggingsenhet_1m2, ntyp_clean)
+
+ANO_geo_candidates <- ANO.geo_reg %>%
+                          left_join(naturinfo,
+                                    by = c("kartleggingsenhet_1m2" = "Kartleggingsenheter")) %>%
+                          filter(is.na(Sone) | Sone == Sone_kode)
+
+ANO_geo_candidates_compact <- ANO_geo_candidates %>%
+                                  st_drop_geometry() %>%
+                                  group_by(globalid, Sone_kode, kartleggingsenhet_1m2) %>%
+                                  summarise(kandidat_koder = paste(unique(Naturtype_kode), collapse = ", "),
+                                            kandidat_navn  = paste(unique(Naturtype), collapse = ", "),
+                                            .groups = "drop") %>% 
+                                 filter(!(kandidat_koder == "NA")) 
+
+```
+
+After identifying all possible candidate nature types for each kartleggingsenhet and sone, we apply an additional rule-based filter to determine which of these candidates we can reliably infer. A naturtype can only be inferred automatically if both of the following conditions are met:
+
+1.  The kartleggingsenhet is uniquely associated with a single naturtype (i.e., the KE does not map to multiple naturtyper in naturinfo), and
+
+2.  The nature type is not conditional on additional ecological variables that are not available in the dataset (e.g., landform type, water‐splash intensity, old trees).
+
+3.  If kartleggingsenhet is V3-C-1 or V3-C-2 it can automatically go to E12 nedbørsmyr
+
+```{r}
+#| message: false
+#| warning: false
+
+cannot_infer <- c("A2", "A2.1", "E1", "E11.1") # conditiones on additional ecological variables
+
+
+ANO_geo_inferred <- ANO_geo_candidates_compact %>%
+                          mutate(kode_list      = strsplit(kandidat_koder, ",\\s*"),
+                                 n_kandidater   = lengths(kode_list),
+                                 kode = case_when( kartleggingsenhet_1m2 %in% c("V3-C-1", "V3-C-2") ~ "E12",
+                                                   n_kandidater == 1 ~ sapply(kode_list, `[`, 1L),
+                                                    TRUE ~ NA_character_ ) ) %>%
+                          filter(!is.na(kode)) %>%
+                          filter(!kode %in% cannot_infer)
+
+
+inferred_ntyp <- ANO_geo_inferred %>%
+                    select(globalid, ntyp_inferred = kode)
+table(inferred_ntyp$ntyp_inferred)
+
+ANO.geo2 <- ANO.geo2 %>%
+              left_join(inferred_ntyp, by = "globalid") %>%
+              mutate(ntyp_final = case_when(!ntyp %in% c("nei", "blank", NA) & !is.na(ntyp_clean) ~ ntyp_clean,
+                                            TRUE   ~ ntyp_inferred))
+
+ANO_counts <- ANO.geo2 %>%
+                st_drop_geometry() %>%
+                mutate(has_ntyp_clean = if_else(is.na(ntyp_clean) | ntyp_clean == "", "no", "yes"),
+                       has_ntyp_final = if_else(is.na(ntyp_final) | ntyp_final == "", "no", "yes")) %>%
+                summarise(ntyp_clean_yes = sum(has_ntyp_clean == "yes"),
+                          ntyp_clean_no  = sum(has_ntyp_clean == "no"),
+                          ntyp_final_yes = sum(has_ntyp_final == "yes"),
+                          ntyp_final_no  = sum(has_ntyp_final == "no"),
+                          .groups = "drop")
+ANO_counts
+ANO_summary_wide <- tibble::tibble(type  = c("ntyp_clean", "ntyp_final"),
+                                   yes   = c(ANO_counts$ntyp_clean_yes, ANO_counts$ntyp_final_yes),
+                                   no    = c(ANO_counts$ntyp_clean_no,  ANO_counts$ntyp_final_no)) %>%
+                      mutate(total = yes + no)
+ANO_summary_wide
+
+```
+
+The nature types E2–E7 are all conditional on landform. Despite being defined as separate nature types, they all use the same kartleggingsenhet (V3), share overlapping species composition, and have tilstand calculated from the same variables. To increase sample size for these types, we merge all occurrences of E2–E7 into the broader nature type: E12 — Nedbørsmyr. We exclude the subtypes E12.1 and E12.2 from this merger, since these are additionally conditioned on sone.
+
+```{r}
+#| message: false
+#| warning: false
+ANO.geo2 <- ANO.geo2 %>%
+  mutate(ntyp_final = case_when(ntyp_final %in% paste0("E", 2:7) ~ "E12",  
+                                TRUE ~ ntyp_final))
+table(ANO.geo2$ntyp_final)
+```
+
+### Remove observations missing naturype
+
+```{r}
+ANO.geo3 <- ANO.geo2 %>% 
+              filter(!is.na(ntyp_final) & ntyp_final != "")
+
+# take out B2, B8.1. B8.2 sd they are not classified in the mdir instruction
+ANO.geo3 <- ANO.geo3 %>% 
+              filter(!(ntyp_final %in% c('B2', 'B8.1', 'B8.2')))
+
+table(ANO.geo3$ntyp_final)
+```
+
+## Filter to kartleggingsenhet and sones allowed in each nature type
+
+```{r}
+#| message: false
+#| warning: false
+
+### 1. clean up the kartleggingsenhet. there is a bunch of text in there.
+ANO.geo3 <- ANO.geo3 %>%
+                mutate(kartleggingsenhet_1m2 = kartleggingsenhet_1m2 %>%
+                      str_trim() %>%            
+                      str_replace(" .*", ""))
+
+### 2. Build lookup lists from naturinfo
+naturinfo <- read_excel("Naturtyper_informasjon.xlsx")
+
+naturinfo_expanded <- naturinfo %>%
+                        separate_rows(Kartleggingsenheter, sep = ",") %>%
+                        mutate(Kartleggingsenheter = str_trim(Kartleggingsenheter))
+
+# Named list: allowed kartleggingsenheter per naturtype
+allowed_kart_list <- naturinfo_expanded %>%
+                        group_by(Naturtype_kode) %>%
+                        summarise(allowed_kart = list(unique(Kartleggingsenheter)),
+                                  .groups = "drop") %>%
+                        deframe()
+
+# Named list: allowed soner per naturtype
+allowed_sone_list <- naturinfo_expanded %>%
+                        group_by(Naturtype_kode) %>%
+                        summarise(allowed_sone = list(unique(Sone)),
+                                  .groups = "drop") %>%
+                        deframe()
+
+
+### 3. Helper function: check if one plot is allowed (kartleggingsenhet + sone)
+is_kartlegging_allowed <- function(ntyp_code, kart_code, sone_code) {
+
+  # If naturtype missing → cannot decide
+  if (is.na(ntyp_code) || ntyp_code == "") return(NA)
+
+  # Look up allowed kartleggingsenheter
+  allowed_kart <- allowed_kart_list[[ntyp_code]]
+  if (is.null(allowed_kart)) return(NA)   # naturtype not in table
+
+  kart_ok <- !is.na(kart_code) && kart_code %in% allowed_kart
+
+  # Look up allowed sone
+  allowed_sone <- allowed_sone_list[[ntyp_code]]
+
+  # If no sone restriction (only NA values) → sone is ok
+  if (is.null(allowed_sone) || all(is.na(allowed_sone))) {
+    sone_ok <- TRUE
+  } else {
+    sone_ok <- !is.na(sone_code) && sone_code %in% allowed_sone
+  }
+
+  kart_ok & sone_ok
+}
+
+### 4. Apply to all plots in ANO.geo3
+ANO.geo3 <- ANO.geo3 %>%
+              rowwise() %>%  
+              mutate(kartlegging_ok = is_kartlegging_allowed(
+                      ntyp_final,
+                      kartleggingsenhet_1m2,
+                      Sone_kode)) %>%
+              ungroup()
+
+
+```
+
+Some things are typed very wrong in field.... Like skog in A5 Strandeng or våtmark i B3.1 Kalkfattig og intermediær fjellhei, leside og tundra??
+
+```{r}
+test <- ANO.geo3 %>% 
+          st_drop_geometry() %>% 
+          filter(globalid %in% c("{DF6FD8E5-ED9A-451E-B74B-B15BC78EFC78}",
+                                  "{5E186788-5BB4-4064-BCB8-8D6786820677}")) %>% 
+          select(globalid, hovedoekosystem_250m2, ntyp_final,
+                 kartleggingsenhet_1m2, Sone_kode, kartlegging_ok)
+test
+```
+
+```{r}
+# filter based on matches 
+ANO.geo4 <- ANO.geo3 %>% 
+               filter(kartlegging_ok=="TRUE")
+
+ANO.wrong <- ANO.geo3 %>% 
+                filter(kartlegging_ok=="FALSE") %>% 
+                select(ntyp_final, kartleggingsenhet_1m2, Sone_kode, hovedoekosystem_250m2)
+  
+
+table(ANO.geo4$ntyp_final)
+
+test <- ANO.geo3 %>% 
+          filter(ntyp == "ntyp_E10_03")
+
+ANO_counts <- ANO.geo4 %>%
+                st_drop_geometry() %>%
+                mutate(has_ntyp_clean = if_else(is.na(ntyp_clean) | ntyp_clean == "", "no", "yes"),
+                       has_ntyp_final = if_else(is.na(ntyp_final) | ntyp_final == "", "no", "yes")) %>%
+                summarise(ntyp_clean_yes = sum(has_ntyp_clean == "yes"),
+                          ntyp_clean_no  = sum(has_ntyp_clean == "no"),
+                          ntyp_final_yes = sum(has_ntyp_final == "yes"),
+                          ntyp_final_no  = sum(has_ntyp_final == "no"),
+                          .groups = "drop")
+```
+
+
+
+# Classify condition for each ANO circle
+
+## Translate numbers to tilstand for the variables
+
+```{r}
+#| message: false
+#| warning: false
+# import lookup file
+naturclass <- readxl::read_excel("Naturtyper_eksport_full_med_naturtype_kode_07.10.2025.xlsx", sheet = "Tilstand2",  col_types = "text")
+
+# rename variable names to match
+ANO.geo4 <- ANO.geo4 %>% 
+              rename("7GR-GI" = "7GR_GI",
+                     "7JB-SI" = "7JB_SI",
+                     "7JB-BA" = "7JB_BA",
+                     "7JB-BT" = "7JB_BT")
+
+# keep only the variables we a going to use
+valid_vars <- c("7GR-GI", "7JB-SI", "7JB-BA", "7JB-BT",
+                "MdirPRSL", "MdirPRTK", "1AG-B", "7FA")
+
+naturclass_filtered <- naturclass %>%
+                          mutate(Variabel2 = str_extract(Variabel, "(?<=\\().+?(?=\\))")) %>% 
+                          relocate(Variabel2, .after = Variabel)  %>% 
+                          filter(Variabel2 %in% valid_vars) %>%
+                          mutate(across(c(God, Moderat, Daarlig, `Svaert redusert`),
+                                           ~ .x |>
+                                          str_replace_all("\\s*\\([^)]*\\)", "") |>  
+                                          str_trim() |>                              
+                                          na_if("-"))) %>% 
+                          select(-"Primær/sekundær")
+table(naturclass_filtered$Variabel2)
+
+
+# 1) create a look-up file
+lookup_long <- naturclass_filtered %>%
+                  pivot_longer(cols = c(God, Moderat, Daarlig, 'Svaert redusert'),
+                                names_to = "Kvalitet",
+                                values_to = "Values") %>%
+                  separate_rows(Values, sep = ",") %>%
+                  mutate(Values = str_trim(Values),
+                         Values = na_if(Values, ""))
+
+# 2) long data file
+vars_to_class <- intersect(lookup_long$Variabel2, names(ANO.geo4))
+
+ANO_long <- ANO.geo4 %>%
+              mutate(across(all_of(vars_to_class), as.character)) %>%
+              st_drop_geometry() %>%
+              pivot_longer(cols = all_of(vars_to_class),
+                            names_to  = "Variabel2",
+                            values_to = "Value")
+
+# 3) JOIN ON naturtype + variable + value
+joined <- ANO_long %>%
+            left_join(lookup_long, by = c("ntyp_final" = "Naturtype_kode",
+                                          "Variabel2"  = "Variabel2",
+                                          "Value"      = "Values"))
+
+# 4) if Value is NA, force Kvalitet to NA
+classified_long <- joined %>%
+                      mutate(Kvalitet = if_else(is.na(Value) | Value == "",
+                             NA_character_, Kvalitet)) %>%
+                      group_by(globalid, Variabel2) %>%
+                      summarise(Value    = first(Value),
+                                Kvalitet = first(Kvalitet),
+                                .groups  = "drop")
+
+# 5) wide and join back
+class_wide <- classified_long %>%
+                  mutate(Kvalitet_col = paste0(Variabel2, "_klass")) %>%
+                  select(globalid, Kvalitet_col, Kvalitet) %>%
+                  pivot_wider(names_from  = Kvalitet_col,
+                              values_from = Kvalitet)
+
+ANO.geo5 <- ANO.geo4 %>%
+              left_join(class_wide, by = "globalid")
+
+# all classification columns (whatever exists)
+klass_cols <- grep("_klass$", names(ANO.geo5), value = TRUE)
+
+# move them all to appear right after 7FA
+ANO.geo5 <- ANO.geo5 %>%
+              relocate(all_of(klass_cols), .after = `7FA`)
+
+vars <- c("1AG-B_klass", "7FA_klass", "7GR-GI_klass",
+          "7JB-BA_klass", "7JB-BT_klass", "MdirPRSL_klass",
+          "MdirPRTK_klass")
+  # non of the nature types used 7JB-SI
+
+class_distribution <- ANO.geo5 %>%
+  st_drop_geometry() %>%
+  select(all_of(vars)) %>%
+  pivot_longer(cols = everything(),
+               names_to = "Variable",
+               values_to = "Kvalitet") %>%
+  filter(!is.na(Kvalitet)) %>%
+  count(Variable, Kvalitet) %>%
+  arrange(Variable, desc(n))
+
+class_distribution
+
+quality_levels <- c("God", "Moderat", "Daarlig", "Svaert redusert")
+plot_colors <- c("God"             = "#1b9e77",
+                  "Moderat"         = "#d95f02",
+                  "Daarlig"         = "#7570b3",
+                  "Svaert redusert" = "#e7298a")
+
+ANO.geo5 %>%
+  st_drop_geometry() %>%
+  select(all_of(vars)) %>%                     
+  pivot_longer(cols = everything(),
+               names_to = "Variable",
+               values_to = "Kvalitet") %>%
+  filter(!is.na(Kvalitet)) %>%                
+  mutate(Kvalitet = factor(Kvalitet, levels = quality_levels, ordered = TRUE)) %>%
+      ggplot(aes(x = Kvalitet, fill = Kvalitet)) +
+      geom_bar() +
+      scale_fill_manual(values = plot_colors, name = "Klasse") +
+      facet_wrap(~ Variable, scales = "free_y") +
+      theme_bw(base_size = 14) +
+      labs(title = "Antall i hver klasse per tilstandsvariabel",
+            x = "Kvalitet",  y = "Antall") +
+      theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+            axis.text.x = element_text(size = 11, colour = "black",  angle = 45, hjust = 1),
+            axis.text.y = element_text(size = 11, colour = "black"),
+            panel.grid.major.x = element_blank(),
+            axis.title.x = element_blank(),
+             legend.position = "none")
+
+```
+
+## Assign final tilstands classification based on the variables
+
+The worst level will decide the final tilstand (Svaert redusert \< Daarlig \< Moderat \< God)
+
+```{r, fig.height=6, fig.width=7}
+#| message: false
+#| warning: false
+klass_vars <- c("1AG-B_klass", "7FA_klass", "7GR-GI_klass",
+                "7JB-BA_klass", "7JB-BT_klass", "MdirPRSL_klass",  "MdirPRTK_klass")
+
+quality_levels = c("Svaert redusert", "Daarlig", "Moderat", "God")
+
+ANO.geo5 <- ANO.geo5 %>%
+              mutate(across(all_of(klass_vars),
+                  ~ factor(.x, levels = quality_levels, ordered = TRUE))) %>%
+              rowwise() %>%
+              mutate(Classification = {
+                  vals <- c_across(all_of(klass_vars))
+                  if (all(is.na(vals))) {
+                    NA_character_
+                  } else {
+                    as.character(min(vals, na.rm = TRUE))
+                  }
+                }) %>%
+              ungroup() %>% 
+              relocate(Classification, .after = 'MdirPRTK_klass')
+
+ANO.geo5 %>%
+  st_drop_geometry() %>%
+  count(Classification) %>%
+  arrange(desc(n))
+
+ANO.geo5 %>%
+  st_drop_geometry() %>%
+  count(ntyp_final) %>%
+  arrange(desc(n)) %>% 
+  print(n=63)
+
+# for some of the nature types the right variables have not been registered to be able to use 
+# this classification. 
+
+plot_colors <- c("God"             = "#1b9e77",
+                 "Moderat"         = "#d95f02",
+                 "Daarlig"         = "#7570b3",
+                 "Svaert redusert" = "#e7298a",
+                 "NA"              = "grey70")
+nice_order  <- c("God", "Moderat", "Daarlig", "Svaert redusert", "NA")
+stack_order <- rev(nice_order)
+
+plot_data <- ANO.geo5 %>%
+              st_drop_geometry() %>%
+              group_by(ntyp_final) %>%
+              filter(n() > 10) %>%
+              ungroup() %>%
+              mutate(Classification = fct_explicit_na(Classification, na_level = "NA"),
+                     Classification = factor(Classification, levels = stack_order)) %>%
+              count(ntyp_final, Classification) %>%
+              group_by(ntyp_final) %>%
+              mutate(total_n = sum(n)) %>%
+              ungroup() %>%
+              mutate(ntyp_final = fct_reorder(ntyp_final, total_n))
+
+```
+
+```{r, fig.height=6, fig.width=8}
+p1<- ggplot(plot_data, aes(x = ntyp_final, y = n, fill = Classification)) +
+          geom_col(width = 0.7) +
+          scale_y_break(c(500, 2500), expand = c(0.05, 0)) +
+          coord_flip() +
+          scale_fill_manual(values = plot_colors,
+                            breaks = nice_order,
+                            name = "Tilstand",
+                            labels = c("God" = "God",
+                                       "Moderat" = "Moderat",
+                                        "Daarlig" = "Dårlig",
+                                        "Svaert redusert" = "Svært redusert",
+                                       "NA" = "NA")) +
+          labs( x = "Naturtype",
+                y = "Antall ANO plot") +
+          theme_bw(base_size = 16) +
+          theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+                legend.key.size = unit(0.55, "cm"),
+                axis.text = element_text(size = 12, colour = "black"),
+                panel.grid.major.y = element_blank())
+p1
+
+ggsave(filename = "barplot.jpeg",
+       plot = p1,
+       width = 9,          
+       height = 7.5,         
+       units = "in",        
+       device = "jpeg",
+       dpi = 600)
+
+```
+
+Trying to compare species abundance in the dårlig and god classification only makes sense for D2 (seminaturlig eng) and B3.1 as this is the only naturetype with enough ANO circles in both conditions.
+
+# 
+
+# Why are so many ANO circles in good condition?
+
+It is related to what variables we use to evaluate on and how many of them are included in the ANO dataset.Many of the nature types have very few of there evaluation variables represented in the ANO data
+
+```{r}
+#| message: false
+#| warning: false
+# raw variable names (without _klass)
+naturclass_filtered <- naturclass %>%
+                          mutate(Variabel2 = str_extract(Variabel, "(?<=\\().+?(?=\\))")) %>% 
+                          relocate(Variabel2, .after = Variabel) 
+
+valid_vars <- c("7GR-GI", "7JB-SI", "7JB-BA", "7JB-BT",
+                "MdirPRSL", "MdirPRTK", "1AG-B", "7FA")
+
+# which variables are normally used to create the classification
+expected_vars <- naturclass_filtered %>%
+                      filter(!is.na(Variabel2)) %>%             
+                      mutate(Variabel2 = str_trim(Variabel2)) %>%
+                      distinct(Naturtype_kode, Variabel2) %>%
+                      rename(ntyp_clean = Naturtype_kode) %>%
+                      mutate(has_column = Variabel2 %in% names(ANO.geo5))  # mark whether this variable exists as a column in ANO.geo5
+
+# variables that are real columns
+present_vars <- expected_vars %>%
+                    filter(has_column) %>%
+                    distinct(Variabel2) %>%
+                    pull()
+
+
+# naturtypes that actually occur in the data
+present_types <- ANO.geo5 %>%
+  distinct(ntyp_clean)
+
+all_cols <- names(ANO.geo5)
+
+# 1) All variables used in the lookup (for types that exist in ANO.geo5)
+vars_per_type <- naturclass_filtered %>%
+                      filter(!is.na(Variabel2)) %>%
+                      mutate(Variabel2 = str_trim(Variabel2)) %>%
+                      semi_join(present_types, by = c("Naturtype_kode" = "ntyp_clean")) %>%
+                      distinct(Naturtype_kode, Variabel2) %>%
+                      rename(ntyp_clean = Naturtype_kode) %>%
+                      mutate(has_column = Variabel2 %in% all_cols)
+
+# 2) Long version of ANO.geo5 for the variables that *do* exist as columns
+raw_vars <- vars_per_type %>%
+                filter(has_column) %>%
+                pull(Variabel2) %>%
+                unique()
+
+ANO_long <- ANO.geo5 %>%
+              st_drop_geometry() %>%
+              mutate(across(all_of(raw_vars), as.character)) %>%
+              select(ntyp_clean, all_of(raw_vars)) %>%
+              pivot_longer(cols = all_of(raw_vars),
+                            names_to  = "Variabel2",
+                            values_to = "Value")
+
+# 3) Combine + summarise in one go
+per_type <- vars_per_type %>%
+                  left_join(ANO_long, by = c("ntyp_clean", "Variabel2")) %>%
+                  group_by(ntyp_clean, Variabel2) %>%
+                  summarise(has_column = first(has_column),
+                            has_data   = has_column && any(!is.na(Value)),
+                            .groups = "drop") %>%
+                  group_by(ntyp_clean) %>%
+                  summarise('primary variables from mdir'    = n(),          # from lookup
+                            'variables in ANO data' = sum(has_column),      # exist as columns
+                            'variables that has data'   = sum(has_data),        # have any non-NA value
+                            .groups = "drop") %>%
+                  arrange(ntyp_clean)
+
+per_type
+
+summary_stats <- per_type %>%
+  summarise(
+    n_naturtyper = n(),
+    total_primary = sum(`primary variables from mdir`, na.rm = TRUE),
+    total_in_ano = sum(`variables in ANO data`, na.rm = TRUE),
+    total_with_data = sum(`variables that has data`, na.rm = TRUE),
+    naturtyper_med_fullt_sett = sum(`primary variables from mdir` == `variables in ANO data`),
+    naturtyper_med_delvis = sum(`variables in ANO data` > 0 & `variables in ANO data` < `primary variables from mdir`),
+    naturtyper_uten_variabler = sum(`variables in ANO data` == 0),
+    naturtyper_uten_data = sum(`variables that has data` == 0)
+  )
+
+summary_stats
+```
+
+# 
+
+# Ordination
+
+For most nature types, the number of ANO plots classified as 'Dårlig' or 'Svært redusert' is too low to allow a meaningful comparison of species
+composition between condition classes. As a result, ordination analyses were restricted to nature types with sufficient sample size in both 'God' and
+'Dårlig' condition classes.
+
+
+**B3.1**
+
+```{r}
+#| message: false
+#| warning: false
+#| output: false
+
+ANO.ordB3 <- ANO.geo5 %>% 
+                filter(ntyp_clean == "B3.1",
+                       Classification %in% c("God", "Daarlig", "Svaert redusert"))
+table(ANO.ordB3$Classification)
+
+## 1. Join: attach ANO.geo metadata to each ANO.sp subplot
+##    (keep only subplots that actually have a parent)
+ANO_linkedB3 <- ANO.sp %>%
+  inner_join(ANO.ordB3, by = c("parentglobalid" = "globalid"))
+# After this:
+# - globalid        = ID of the ANO.sp subplot  (site)
+# - parentglobalid  = ID of the ANO.geo plot (parent)
+# - + all metadata from ANO.geo
+table(ANO_linkedB3$parentglobalid)
+
+bad_plot <- c("{6B40A690-24D3-4BAF-9FBC-3CCCF467F46F}", "{A102AC14-3760-41C7-9043-320E42FABE18}", "{C0772BDC-000B-49AF-9730-6AD8C42575F4}")
+ANO_linkedB3 <- ANO_linkedB3 %>%
+                filter(parentglobalid != bad_plot)
+
+## 2. Make wide species matrix aggregated at the 250m
+ANO_parent_wideB3 <- ANO_linkedB3 %>%
+                        group_by(parentglobalid,
+                                 hovedoekosystem_250m2,
+                                 kartleggingsenhet_1m2,
+                                 hovedtype_1m2,
+                                 ntyp_clean,
+                                 Classification,     
+                                 art_navn) %>%
+                        summarise(art_dekning = max(art_dekning), .groups = "drop") %>%
+                        pivot_wider(id_cols = c(parentglobalid,
+                                                hovedoekosystem_250m2,
+                                                kartleggingsenhet_1m2,
+                                                hovedtype_1m2,
+                                                ntyp_clean,
+                                                Classification),
+                                    names_from  = art_navn,
+                                    values_from = art_dekning,
+                                    values_fill = 0) %>%
+                        rename(site_id = parentglobalid)
+
+## 3. Split into species matrix and environment data for vegan
+sp_matB3 <- ANO_parent_wideB3 %>%
+            select(-hovedoekosystem_250m2,
+                   -kartleggingsenhet_1m2,
+                   -hovedtype_1m2,
+                   -ntyp_clean,
+                   -Classification) %>%
+            column_to_rownames("site_id") %>%
+            as.matrix()
+
+sp_matB3[is.na(sp_matB3)] <- 0
+sp_matB3 <- sp_matB3[rowSums(sp_matB3) > 0, ]
+sp_matB3 <- sp_matB3[, colSums(sp_matB3) > 0]
+
+which(rowSums(sp_matB3) == 0)
+which(colSums(sp_matB3) == 0)
+
+envB3 <- ANO_parent_wideB3 %>%
+            select(site_id,
+                   hovedoekosystem_250m2,
+                   kartleggingsenhet_1m2,
+                   hovedtype_1m2,
+                   ntyp_clean,
+                   Classification) %>%
+            distinct(site_id, .keep_all = TRUE) %>%
+            column_to_rownames("site_id")
+envB3 <- envB3[rownames(sp_matB3), ]
+
+bad_sites <- c("{6B40A690-24D3-4BAF-9FBC-3CCCF467F46F}", "{A102AC14-3760-41C7-9043-320E42FABE18}", "{C0772BDC-000B-49AF-9730-6AD8C42575F4}")
+  # Extreme outliers
+
+sp_mat_fB3 <- sp_matB3[!rownames(sp_matB3) %in% bad_sites, ]
+env_fB3    <- envB3[!rownames(envB3) %in% bad_sites, ]
+
+```
+
+**D2**
+
+```{r}
+#| message: false
+#| warning: false
+#| output: false
+
+ANO.ordD2 <- ANO.geo5 %>% 
+              filter(ntyp_clean == "D2",
+                     Classification %in% c("God", "Daarlig"))
+
+## 1. Join: attach ANO.geo metadata to each ANO.sp subplot
+##    (keep only subplots that actually have a parent)
+ANO_linkedD2 <- ANO.sp %>%
+  inner_join(ANO.ordD2, by = c("parentglobalid" = "globalid"))
+table(ANO.ordD2$Classification)
+# After this:
+# - globalid        = ID of the ANO.sp subplot  (site)
+# - parentglobalid  = ID of the ANO.geo plot (parent)
+# - + all metadata from ANO.geo
+table(ANO_linkedD2$parentglobalid)
+
+## 2. Make wide species matrix with site = ANO.sp globalid
+ANO_parent_wideD2 <- ANO_linkedD2 %>%
+                        group_by(parentglobalid,
+                                 hovedoekosystem_250m2,
+                                 kartleggingsenhet_1m2,
+                                 hovedtype_1m2,
+                                 ntyp_clean,
+                                 Classification,     
+                                 art_navn) %>%
+                        pivot_wider(id_cols = c(parentglobalid,
+                                                hovedoekosystem_250m2,
+                                                kartleggingsenhet_1m2,
+                                                hovedtype_1m2,
+                                                ntyp_clean,
+                                                Classification),
+                                    names_from  = art_navn,
+                                    values_from = art_dekning,
+                                    values_fill = 0) %>%
+                        rename(site_id = parentglobalid) %>% 
+                        ungroup()
+
+## 3. Split into species matrix and environment data for vegan
+sp_matD2 <- ANO_parent_wideD2 %>%
+                select(-hovedoekosystem_250m2,
+                       -kartleggingsenhet_1m2,
+                       -hovedtype_1m2,
+                       -ntyp_clean,
+                       -Classification) %>%
+                column_to_rownames("site_id") %>%
+                as.matrix()
+
+sp_matD2[is.na(sp_matD2)] <- 0
+sp_matD2 <- sp_matD2[rowSums(sp_matD2) > 0, ]
+sp_matD2 <- sp_matD2[, colSums(sp_matD2) > 0]
+
+which(rowSums(sp_matD2) == 0)
+which(colSums(sp_matD2) == 0)
+
+
+envD2 <- ANO_parent_wideD2 %>%
+              select(site_id,
+                     hovedoekosystem_250m2,
+                     kartleggingsenhet_1m2,
+                     hovedtype_1m2,
+                     ntyp_clean,
+                     Classification) %>%
+              distinct(site_id, .keep_all = TRUE) %>%
+              column_to_rownames("site_id")
+
+envD2 <- envD2[rownames(sp_matD2), ]
+```
+
+## Ordination
+
+**B3.1**
+
+```{r}
+#| message: false
+#| warning: false
+#| output: false
+
+#set.seed(123)
+#ord.B3 <- metaMDS(sp_mat_fB3, k =3, distance = "bray", trymax = 200)
+#saveRDS(ord.B3, "ord.B3.rds")
+ord.B3 <- readRDS("C:/Users/mie.arnberg/OneDrive - NINA/ANO/ord.B3.rds")
+
+env_fitB3 <- env_fB3 %>%
+            select(Classification) %>%
+            mutate( Classification = as.factor(Classification))
+
+set.seed(123)
+fitB3 <- envfit(ord.B3, env_fitB3, permutations = 999)
+```
+
+```{r}
+#| message: false
+#| warning: false
+ord.B3$stress
+
+fitB3
+```
+
+**D2**
+
+```{r}
+#| message: false
+#| warning: false
+#| output: false
+
+# with different transofrmations 
+set.seed(123)
+ord.D2 <- metaMDS(sp_matD2, distance = "bray", trymax = 200)
+
+env_fitD2 <- envD2 %>%
+            select(Classification) %>%
+            mutate( Classification = as.factor(Classification))
+
+set.seed(123)
+fitD2 <- envfit(ord.D2, env_fitD2, permutations = 999)
+```
+
+
+```{r}
+#| message: false
+#| warning: false
+ord.D2$stress
+
+fitD2
+```
+
+
+**Make a ordination plot**
+```{r, fig.height=6, fig.width=7}
+#| message: false
+#| warning: false
+
+nmds_sitesD2 <- as.data.frame(scores(ord.D2, display = "sites"))
+nmds_sitesD2$site_id <- rownames(nmds_sitesD2)
+centroidsD2 <- as.data.frame(scores(fitD2, "factors"))
+centroidsD2$Classification <- rownames(centroidsD2)
+centroidsD2$Classification <- sub("^Classification", "", rownames(centroidsD2))
+
+plotdataD2 <- nmds_sitesD2 %>%
+               left_join(ANO_parent_wideD2, by = c("site_id" = "site_id"))
+
+nice_order  <- c("God", "Daarlig")
+pD2 <-ggplot(plotdataD2, aes(NMDS1, NMDS2, color = Classification)) +
+                stat_ellipse(linewidth = 1.1) +
+                geom_point(size = 2, alpha = 0.7, shape = 16) +
+                geom_point(data = centroidsD2, aes(x = NMDS1, y = NMDS2, colour = Classification, shape = "Centroid"),
+                           size = 3, stroke = 2) +
+                scale_shape_manual(name = NULL, values = c("Centroid" = 4)) +
+                scale_color_manual(values = c("God"     = "#009E73",
+                                              "Daarlig" = "#7570b3"),
+                                   breaks = nice_order,
+                                   labels = c("God" = "God",
+                                              "Daarlig" = "Dårlig"),
+                                   name = "Tilstand") +
+                theme_minimal() +
+                labs(color = "Classification")+ 
+                 xlim(-1.15, 1.15) + ylim(-1, 1.15) +
+                theme_bw() +
+                theme(panel.grid = element_blank(),   
+                        axis.title.y = element_text(size = 13),
+                       axis.title.x = element_blank(),
+                        axis.text = element_text(size = 11),
+                        legend.text = element_text(size = 11))+
+  guides(color = "none", shape = "none")
+
+
+nmds_sitesB3 <- as.data.frame(scores(ord.B3, display = "sites"))
+nmds_sitesB3$site_id <- rownames(nmds_sitesB3)
+centroidsB3 <- as.data.frame(scores(fitB3, "factors"))
+centroidsB3$Classification <- rownames(centroidsB3)
+centroidsB3$Classification <- sub("^Classification", "", rownames(centroidsB3))
+
+plotdataB3 <- nmds_sitesB3 %>%
+               left_join(ANO_parent_wideB3, by = c("site_id" = "site_id"))
+
+nice_order1  <- c("God", "Daarlig", "Svaert redusert")
+pB3 <- ggplot(plotdataB3, aes(NMDS1, NMDS2, color = Classification)) +
+                geom_point(size = 1, alpha = 0.6, shape = 16) +
+                geom_point(data = centroidsB3, aes(NMDS1, NMDS2),
+                            shape = 4, color = "black", size = 3, stroke = 3)  +
+                geom_point(data = centroidsB3, aes(x = NMDS1, y = NMDS2, colour = Classification, shape = "Centroid"),
+                           size = 3, stroke = 2) +
+                scale_shape_manual(name = NULL, values = c("Centroid" = 4)) +
+                scale_color_manual(values = c("God"     = "#009E73",
+                                              "Daarlig" = "#7570b3",
+                                              "Svaert redusert" = "#e7298a"),
+                                   breaks = nice_order1,
+                                   labels = c("God" = "God",
+                                              "Daarlig" = "Dårlig",
+                                              "Svaert redusert" = "Svært redusert"),
+                                   name = "Tilstand") +
+                stat_ellipse(linewidth = 1.1) +
+                theme_minimal() +
+                labs(color = "Classification")+ 
+                xlim(-1.7, 1.5) + ylim(-1.5, 1.7) +
+                theme_bw() +
+                theme(panel.grid = element_blank(),   
+                        axis.title = element_text(size = 13),
+                        axis.text = element_text(size = 11),
+                        legend.title = element_text(size = 13),
+                        legend.text = element_text(size = 11)) 
+
+
+p2<- (pD2 / pB3) +
+  plot_layout(heights = c(1, 1), guides = "collect") &
+  theme(legend.position = "right")
+p2
+ggsave(filename = "ordination.jpeg",
+       plot = p2,
+       width = 7,          
+       height = 6.5,         
+       units = "in",        
+       device = "jpeg",
+       dpi = 600)
+```
+
+# Species lists
+
+We will make species lists with mean abundance for the different conditions within each nature type.
+
+```{r}
+#| message: false
+#| warning: false
+
+ANO_linked_all <- ANO.sp %>%
+                    inner_join(ANO.geo5, by = c("parentglobalid" = "globalid"))
+
+species_summary <- ANO_linked_all %>%
+                      filter(Classification %in% c("God", "Moderat", "Daarlig", "Svaert redusert")) %>%
+                      group_by(ntyp_final, Classification) %>%
+                      mutate(total_plots = n_distinct(parentglobalid)) %>%
+                      ungroup() %>%
+                      group_by(ntyp_final, Classification, art_navn) %>%
+                      summarise(total_plots     = first(total_plots),
+                                n_plots_species = n_distinct(parentglobalid),
+                                perc_plots      = 100 * n_plots_species / total_plots,
+                                median_cover_present = median(art_dekning, na.rm = TRUE),
+                                mean_cover_all = sum(art_dekning, na.rm = TRUE) / total_plots,
+                                max_cover = suppressWarnings(max(art_dekning, na.rm = TRUE)),
+                                min_cover_obs = suppressWarnings(min(art_dekning, na.rm = TRUE)),
+                                .groups = "drop" ) %>%
+                      mutate(min_cover = ifelse(n_plots_species < total_plots, 0, min_cover_obs),
+                             range_cover = paste0(min_cover, "–", max_cover)) %>%
+                      select(-min_cover_obs) %>%
+                      arrange(ntyp_final, Classification, desc(perc_plots), art_navn)
+
+species_summary
+
+```
+
+```{r}
+#| message: false
+#| warning: false
+species_summary_nice <- species_summary %>%
+                            mutate(perc_plots           = round(perc_plots, 2),
+                                   mean_cover_all       = round(mean_cover_all, 2),
+                                   median_cover_present = round(median_cover_present, 2),
+                                   max_cover            = round(max_cover, 0),   
+                                   min_cover            = round(min_cover, 0),
+                                   perc_str   = format(perc_plots,
+                                                      decimal.mark = ",", big.mark = "", trim = TRUE),
+                                   mean_str   = format(mean_cover_all,
+                                                      decimal.mark = ",", big.mark = "", trim = TRUE),
+                                   median_str = format(median_cover_present,
+                                                      decimal.mark = ",", big.mark = "", trim = TRUE),
+                                   min_str    = format(min_cover,
+                                                      decimal.mark = ",", big.mark = "", trim = TRUE),
+                                   max_str    = format(max_cover,
+                                                      decimal.mark = ",", big.mark = "", trim = TRUE),
+                                   mean_with_range = paste0(mean_str, " (", min_str, "–", max_str, ")"))
+
+
+make_table_for_naturtype <- function(ntype,
+                                     data = species_summary_nice) {
+
+  data %>%
+    filter(ntyp_final == ntype) %>%
+    arrange(factor(Classification,
+                    levels = c("God", "Moderat", "Daarlig", "Svaert redusert")),
+            desc(perc_plots),
+            desc(mean_cover_all),
+            art_navn) %>%
+    mutate(art_cap = str_to_sentence(art_navn),
+          Tilstand = recode(Classification,
+                            "Daarlig" = "Dårlig",
+                            "Svaert redusert" = "Svært redusert",
+                            .default = Classification)) %>%
+    select( `Art`                               = art_cap,
+            `Tilstand`                          = Tilstand,
+            `Antall plott`                      = n_plots_species,
+            `% plott`                           = perc_str,
+            `Middel dekning over alle plott (range)` = mean_with_range,
+            `Median dekning i plot der arten finnes` = median_str )
+}
+
+
+B3.1<- make_table_for_naturtype("B3.1")
+
+
+# make the plot number fan
+plot_oversikt <- ANO.geo5 %>%
+                    filter(Classification %in% c("God", "Moderat", "Daarlig", "Svaert redusert")) %>%
+                    distinct(ntyp_final, Classification, globalid) %>%  # unike plott per naturtype/tilstand
+                    count(ntyp_final, Classification, name = "n_plots") %>%
+                    tidyr::pivot_wider(names_from  = Classification,
+                      values_from = n_plots,
+                      values_fill = 0) %>%
+                    rename( `Naturtype`      = ntyp_final, 
+                            `God`            = God,
+                            `Moderat`        = Moderat,
+                            `Dårlig`         = Daarlig,
+                            `Svært redusert` = `Svaert redusert`) %>%
+                    mutate(`Totalt antall plott` = God + Moderat + `Dårlig` + `Svært redusert`) %>%
+                    arrange(Naturtype)
+
+# Make excle file 
+naturtyper <- sort(unique(species_summary_nice$ntyp_final))
+
+tabs_for_excel <- lapply(naturtyper, function(nt) {
+  make_table_for_naturtype(nt)  
+})
+
+names(tabs_for_excel) <- naturtyper
+
+tabs_for_excel <- c(list("Plot_oversikt" = plot_oversikt),
+                    tabs_for_excel)
+
+write_xlsx(tabs_for_excel, path = "Artslister_per_naturtype_rapport.xlsx")
+
+```
+
+Make a slimmed down list for the report main text.
+
+```{r}
+#| message: false
+#| warning: false
+make_table_for_naturtype <- function(ntype,
+                                     min_perc = 10,
+                                     data = species_summary_nice) {
+
+  # keep only desired condition classes
+  data_nt <- data %>%
+    filter(ntyp_final == ntype,
+      Classification %in% c("God", "Daarlig", "Svaert redusert"))
+
+  # species selection: ≥10 % in at least one condition
+  species_keep <- data_nt %>%
+    group_by(art_navn) %>%
+    summarise(max_perc = max(perc_plots, na.rm = TRUE),
+      .groups = "drop") %>%
+    filter(max_perc >= min_perc) %>%
+    pull(art_navn)
+
+  # final table
+  data_nt %>%
+    filter(art_navn %in% species_keep) %>%
+    arrange(factor(Classification,
+             levels = c("God", "Daarlig", "Svaert redusert")),
+            desc(perc_plots),
+            desc(mean_cover_all),
+            art_navn) %>%
+    mutate(Art = str_to_sentence(art_navn),
+           Tilstand = recode(Classification,
+                             "Daarlig" = "Dårlig",
+                              "Svaert redusert" = "Svært redusert")) %>%
+    select(Art,
+            Tilstand,
+            `Antall plott` = n_plots_species,
+            `% plott` = perc_str,
+            `Middel dekning over alle plott (range)` = mean_with_range,
+            `Median dekning i plott der arten finnes` = median_str)}
+
+B3.1 <- make_table_for_naturtype("B3.1", min_perc = 10)
+
+
+naturtyper <- sort(unique(species_summary_nice$ntyp_final))
+
+tabs_for_excel <- lapply(naturtyper, function(nt) {
+  make_table_for_naturtype(nt, min_perc = 10)
+})
+
+names(tabs_for_excel) <- naturtyper
+
+write_xlsx(tabs_for_excel,
+           path = "Artslister_per_naturtype_God_Darlig_SvaertRedusert1.xlsx")
+
+```
