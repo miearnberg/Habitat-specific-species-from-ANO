@@ -1,5 +1,5 @@
 This repository contains R/Quarto code used in a project investigating whether
-data from **Arealrepresentativ naturovervåking (ANO)** can be used to develop
+data from Arealrepresentativ naturovervåking (ANO) can be used to develop
 improved, regionalised habitat-specific species lists for terrestrial nature
 types in Miljødirektoratet’s mapping instruction.
 
@@ -22,5 +22,5 @@ The analysis follows the methodology used in the report and focuses on:
 
 ### Data
 
-The analysis uses data from **Arealrepresentativ naturovervåking (ANO)** provided
+The analysis uses data from Arealrepresentativ naturovervåking (ANO) provided
 by Miljødirektoratet.  
