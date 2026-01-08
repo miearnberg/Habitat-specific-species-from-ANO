@@ -13,11 +13,11 @@ The analysis follows the methodology used in the report and focuses on:
 
 ### Contents
 
-- `Habitat-specific species from ANO.qmd`  
+- `ANO-naturetypes.qmd`  
   Main Quarto script containing all data preparation, classification,
   summaries, and ordination analyses.
 
-- `Habitat-specific species from ANO.html`  
+- `ANO-naturetype.html`  
   Rendered HTML version of the analysis.
 
 ### Data
